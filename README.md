@@ -1,5 +1,7 @@
 # ai-support-router-starter
 
+[Quick start](#quick-start) · [Contributing](./CONTRIBUTING.md) · [License](./LICENSE)
+
 A realistic customer-support AI workflow starter that classifies inbound tickets, chooses an internal queue, looks up support guidance, drafts a reply, and traces the full execution with Tokvera.
 
 ## Why this repo matters
@@ -171,6 +173,10 @@ src/
 - add Slack / email escalation hooks
 - attach screenshots or payload references to Tokvera traces
 - add a small frontend UI for support team review
+
+## Contributing
+
+Contributions are welcome. See [CONTRIBUTING.md](./CONTRIBUTING.md) for local setup, pull request expectations, and contribution scope.
 
 ## Suggested article angles
 
