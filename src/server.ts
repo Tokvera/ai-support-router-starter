@@ -1,7 +1,8 @@
 import "dotenv/config";
-import express from "express";
+import express, { Request, Response } from "express";
 import OpenAI from "openai";
 import { z } from "zod";
+import { sampleTickets } from "./sample-tickets.js";
 import {
   createTokveraTracer,
   finishSpan,
@@ -41,11 +42,17 @@ const ticketSchema = z.object({
 
 type Ticket = z.infer<typeof ticketSchema>;
 type TicketCategory = "billing" | "bug" | "feature" | "general";
+type SupportQueue = "billing-ops" | "engineering" | "product-feedback" | "customer-support";
+type SupportTone = "reassuring" | "urgent" | "consultative" | "helpful";
 
 type Classification = {
   category: TicketCategory;
   priority: "low" | "medium" | "high";
   shouldEscalate: boolean;
+  queue: SupportQueue;
+  suggestedOwner: string;
+  suggestedSlaHours: number;
+  tone: SupportTone;
   policyKey: "billing" | "incident" | "feature" | "general";
   shortReason: string;
 };
@@ -69,13 +76,7 @@ const policies: Record<Classification["policyKey"], { title: string; guidance: s
   },
 };
 
-const demoTicket: Ticket = {
-  subject: "Need help understanding extra usage charges",
-  message: "Our finance team saw a larger invoice this week. Can you explain what changed and what we should check first?",
-  plan: "pro",
-  customerName: "Riya",
-  customerEmail: "riya@example.com",
-};
+const demoTicket: Ticket = sampleTickets[0];
 
 function parseModelJson<T>(value: string, fallback: T): T {
   try {
@@ -93,6 +94,10 @@ function heuristicClassify(ticket: Ticket): Classification {
       category: "billing",
       priority: ticket.plan === "enterprise" ? "high" : "medium",
       shouldEscalate: ticket.plan === "enterprise",
+      queue: "billing-ops",
+      suggestedOwner: "billing",
+      suggestedSlaHours: ticket.plan === "enterprise" ? 4 : 8,
+      tone: "reassuring",
       policyKey: "billing",
       shortReason: "billing language detected",
     };
@@ -102,6 +107,10 @@ function heuristicClassify(ticket: Ticket): Classification {
       category: "bug",
       priority: "high",
       shouldEscalate: true,
+      queue: "engineering",
+      suggestedOwner: "support-engineering",
+      suggestedSlaHours: 2,
+      tone: "urgent",
       policyKey: "incident",
       shortReason: "incident language detected",
     };
@@ -111,6 +120,10 @@ function heuristicClassify(ticket: Ticket): Classification {
       category: "feature",
       priority: "low",
       shouldEscalate: false,
+      queue: "product-feedback",
+      suggestedOwner: "product-ops",
+      suggestedSlaHours: 24,
+      tone: "consultative",
       policyKey: "feature",
       shortReason: "feature request language detected",
     };
@@ -119,9 +132,38 @@ function heuristicClassify(ticket: Ticket): Classification {
     category: "general",
     priority: ticket.plan === "enterprise" ? "medium" : "low",
     shouldEscalate: false,
+    queue: "customer-support",
+    suggestedOwner: "support",
+    suggestedSlaHours: ticket.plan === "enterprise" ? 6 : 12,
+    tone: "helpful",
     policyKey: "general",
     shortReason: "default support route",
   };
+}
+
+function buildNextActions(ticket: Ticket, classification: Classification): string[] {
+  const actions = [
+    `Assign to ${classification.suggestedOwner}`,
+    `Respond within ${classification.suggestedSlaHours} hour${classification.suggestedSlaHours === 1 ? "" : "s"}`,
+  ];
+
+  if (classification.category === "billing") {
+    actions.push("Review included usage, overages, and invoice change history");
+  }
+
+  if (classification.category === "bug") {
+    actions.push("Collect reproduction details, timestamps, and trace IDs");
+  }
+
+  if (classification.category === "feature") {
+    actions.push("Log the feature request and link it to product feedback review");
+  }
+
+  if (classification.shouldEscalate) {
+    actions.push(`Escalate because the ${ticket.plan} plan requires faster handling`);
+  }
+
+  return actions;
 }
 
 async function classifyTicket(ticket: Ticket, parent: ReturnType<typeof startSpan>): Promise<Classification> {
@@ -146,7 +188,7 @@ async function classifyTicket(ticket: Ticket, parent: ReturnType<typeof startSpa
       {
         role: "system",
         content:
-          "Classify support tickets. Return minified JSON with keys category, priority, shouldEscalate, policyKey, shortReason. category must be one of billing, bug, feature, general. priority must be low, medium, or high. policyKey must be billing, incident, feature, or general.",
+          "Classify support tickets. Return minified JSON with keys category, priority, shouldEscalate, queue, suggestedOwner, suggestedSlaHours, tone, policyKey, shortReason. category must be one of billing, bug, feature, general. priority must be low, medium, or high. queue must be one of billing-ops, engineering, product-feedback, customer-support. tone must be one of reassuring, urgent, consultative, helpful. policyKey must be billing, incident, feature, or general. suggestedSlaHours must be a number.",
       },
       {
         role: "user",
@@ -156,9 +198,12 @@ async function classifyTicket(ticket: Ticket, parent: ReturnType<typeof startSpa
   });
 
   const content = completion.choices[0]?.message?.content || "";
-  const parsed = parseModelJson<Classification>(content, fallback);
+  const parsed = parseModelJson<Partial<Classification>>(content, fallback);
   finishSpan(parent, { response: completion, model: openAIModel });
-  return parsed;
+  return {
+    ...fallback,
+    ...parsed,
+  };
 }
 
 async function draftReply(ticket: Ticket, classification: Classification, policy: { title: string; guidance: string }, parent: ReturnType<typeof startSpan>): Promise<string> {
@@ -196,15 +241,19 @@ async function draftReply(ticket: Ticket, classification: Classification, policy
   return answer;
 }
 
-app.get("/health", (_req, res) => {
+app.get("/health", (_req: Request, res: Response) => {
   res.json({ ok: true, mockMode: isMockMode });
 });
 
-app.get("/api/demo-ticket", (_req, res) => {
+app.get("/api/demo-ticket", (_req: Request, res: Response) => {
   res.json(demoTicket);
 });
 
-app.post("/api/tickets/reply", async (req, res) => {
+app.get("/api/sample-tickets", (_req: Request, res: Response) => {
+  res.json(sampleTickets);
+});
+
+app.post("/api/tickets/reply", async (req: Request, res: Response) => {
   const parsed = ticketSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ error: parsed.error.flatten() });
@@ -248,22 +297,43 @@ app.post("/api/tickets/reply", async (req, res) => {
       finishSpan(draftSpan, { response: { message: reply }, model: "mock-support-writer" });
     }
 
+    const triage = {
+      category: classification.category,
+      priority: classification.priority,
+      shouldEscalate: classification.shouldEscalate,
+      queue: classification.queue,
+      suggestedOwner: classification.suggestedOwner,
+      suggestedSlaHours: classification.suggestedSlaHours,
+      tone: classification.tone,
+      shortReason: classification.shortReason,
+    };
+    const nextActions = buildNextActions(ticket, classification);
+
     finishSpan(root, {
       response: {
-        category: classification.category,
-        priority: classification.priority,
-        shouldEscalate: classification.shouldEscalate,
+        ...triage,
+        nextActions,
       },
     });
 
     return res.json({
       traceId: root.trace_id,
       runId: root.run_id,
-      category: classification.category,
-      priority: classification.priority,
-      shouldEscalate: classification.shouldEscalate,
+      ticket: {
+        subject: ticket.subject,
+        plan: ticket.plan,
+        customerName: ticket.customerName,
+        customerEmail: ticket.customerEmail,
+      },
+      triage,
       policy,
+      nextActions,
       reply,
+      meta: {
+        mockMode: isMockMode,
+        provider: isMockMode ? "mock" : "openai",
+        model: isMockMode ? "mock-support-writer" : openAIModel,
+      },
     });
   } catch (error) {
     finishSpan(root, {
